@@ -1,49 +1,46 @@
 from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
 
 # ============================================================
-# PATHS
+# CONFIGURATION
 # ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# Script location: C:\Prognosx\training
+# Project root:    C:\Prognosx
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 SEQUENCE_DIR = (
-    PROJECT_ROOT
-    / "data"
-    / "processed"
-    / "sequences"
+    PROJECT_ROOT / "data" / "processed" / "sequences"
 )
 
-MODEL_PATH = (
-    PROJECT_ROOT
-    / "models"
-    / "best_temporal_model.pt"
+CHECKPOINT_PATH = (
+    PROJECT_ROOT / "models" / "best_temporal_model_l2.pt"
 )
 
+BATCH_SIZE = 64
 
-# ============================================================
-# DEVICE
-# ============================================================
+CLINICAL_START = 512
+CLINICAL_END = 523
 
 DEVICE = torch.device(
-    "cuda"
-    if torch.cuda.is_available()
-    else "cpu"
+    "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-print("=" * 60)
-print("TRANSFORMER MODEL EVALUATION")
-print("=" * 60)
-
-print(f"Device: {DEVICE}")
+print(f"Using device: {DEVICE}")
+print(f"Project root: {PROJECT_ROOT}")
+print(f"Sequence directory: {SEQUENCE_DIR}")
 
 
 # ============================================================
-# MODEL
+# TEMPORAL TRANSFORMER
+# Must match the training architecture
 # ============================================================
 
 class TemporalTransformer(nn.Module):
@@ -54,258 +51,434 @@ class TemporalTransformer(nn.Module):
         d_model=256,
         n_heads=8,
         num_layers=3,
-        ff_dim=512,
-        dropout=0.1
+        dim_feedforward=512,
+        dropout=0.1,
+        sequence_length=3,
+        output_dim=512,
     ):
-
         super().__init__()
 
         self.input_projection = nn.Linear(
             input_dim,
-            d_model
+            d_model,
         )
 
-        self.position_embedding = nn.Parameter(
-            torch.randn(
+        self.positional_embedding = nn.Parameter(
+            torch.zeros(
                 1,
-                3,
-                d_model
-            )
-        )
-
-        encoder_layer = (
-            nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=n_heads,
-                dim_feedforward=ff_dim,
-                dropout=dropout,
-                batch_first=True,
-                activation="gelu"
-            )
-        )
-
-        self.transformer = (
-            nn.TransformerEncoder(
-                encoder_layer,
-                num_layers=num_layers
-            )
-        )
-
-        self.output_layer = nn.Sequential(
-            nn.Linear(
+                sequence_length,
                 d_model,
-                512
-            ),
-            nn.LayerNorm(512)
+            )
         )
 
+        nn.init.normal_(
+            self.positional_embedding,
+            mean=0.0,
+            std=0.02,
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+        )
+
+        # Predict the 512-dimensional image embedding.
+        self.output_layer = nn.Linear(
+            d_model,
+            output_dim,
+        )
 
     def forward(self, x):
 
+        # Input: [batch, 3, 523]
         x = self.input_projection(x)
 
-        x = (
-            x
-            + self.position_embedding
-        )
+        x = x + self.positional_embedding
 
-        x = self.transformer(x)
+        x = self.transformer_encoder(x)
 
+        # Select the encoded representation of the third visit.
         x = x[:, -1, :]
 
-        return self.output_layer(x)
+        predicted_embedding = self.output_layer(x)
+
+        # L2-normalize the predicted embedding.
+        predicted_embedding = F.normalize(
+            predicted_embedding,
+            p=2,
+            dim=-1,
+            eps=1e-12,
+        )
+
+        # Output: [batch, 512]
+        return predicted_embedding
 
 
 # ============================================================
-# LOAD TEST DATA
+# LOAD CHECKPOINT
 # ============================================================
 
-X = np.load(
-    SEQUENCE_DIR / "test_X.npy"
-)
+if not CHECKPOINT_PATH.exists():
+    raise FileNotFoundError(
+        f"Checkpoint not found:\n{CHECKPOINT_PATH}\n"
+        "Run train_temporal_model.py first."
+    )
 
-y = np.load(
-    SEQUENCE_DIR / "test_y.npy"
-)
-
-
-# ============================================================
-# NORMALIZE CLINICAL FEATURES
-# ============================================================
-
+# Load only checkpoints that you trust, since this checkpoint
+# contains NumPy arrays in addition to model parameters.
 checkpoint = torch.load(
-    MODEL_PATH,
+    CHECKPOINT_PATH,
     map_location=DEVICE,
-    weights_only=False
+    weights_only=False,
 )
 
-clinical_mean = checkpoint[
-    "clinical_mean"
-]
-
-clinical_std = checkpoint[
-    "clinical_std"
-]
-
-X = X.copy()
-
-X[:, :, 512:523] = (
-    X[:, :, 512:523]
-    - clinical_mean
-) / clinical_std
-
-
-# ============================================================
-# TORCH DATA
-# ============================================================
-
-X = torch.tensor(
-    X,
-    dtype=torch.float32
+clinical_mean = np.asarray(
+    checkpoint["clinical_mean"],
+    dtype=np.float32,
 )
 
-y = torch.tensor(
-    y,
-    dtype=torch.float32
+clinical_std = np.asarray(
+    checkpoint["clinical_std"],
+    dtype=np.float32,
 )
 
-dataset = TensorDataset(
-    X,
-    y
+# Validate checkpoint normalization dimensions.
+if clinical_mean.shape != (11,):
+    raise ValueError(
+        f"Expected 11 clinical means, got {clinical_mean.shape}"
+    )
+
+if clinical_std.shape != (11,):
+    raise ValueError(
+        f"Expected 11 clinical standard deviations, "
+        f"got {clinical_std.shape}"
+    )
+
+clinical_std = np.where(
+    np.isfinite(clinical_std) & (clinical_std > 1e-6),
+    clinical_std,
+    1.0,
 )
 
-loader = DataLoader(
-    dataset,
-    batch_size=32,
-    shuffle=False
-)
-
-
-# ============================================================
-# LOAD MODEL
-# ============================================================
-
-model = TemporalTransformer()
+model = TemporalTransformer(
+    input_dim=checkpoint["input_dim"],
+    d_model=checkpoint["d_model"],
+    n_heads=checkpoint["n_heads"],
+    num_layers=checkpoint["num_layers"],
+    dim_feedforward=checkpoint["dim_feedforward"],
+    dropout=checkpoint["dropout"],
+    sequence_length=checkpoint["sequence_length"],
+    output_dim=checkpoint["output_dim"],
+).to(DEVICE)
 
 model.load_state_dict(
     checkpoint["model_state_dict"]
 )
 
-model = model.to(DEVICE)
-
 model.eval()
 
+print("\nCheckpoint loaded successfully.")
+print(f"Checkpoint: {CHECKPOINT_PATH}")
+print(
+    f"Best training epoch: "
+    f"{checkpoint.get('best_epoch', 'unknown')}"
+)
+print(
+    f"Best validation MSE: "
+    f"{checkpoint.get('best_validation_loss', float('nan')):.6f}"
+)
+
 
 # ============================================================
-# PREDICTIONS
+# LOAD TEST ARRAYS
 # ============================================================
 
-predictions = []
-targets = []
+def load_array(filename):
+
+    path = SEQUENCE_DIR / filename
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Could not find sequence file:\n{path}"
+        )
+
+    array = np.load(path)
+
+    print(f"Loaded {filename}: {array.shape}")
+
+    return array
+
+
+test_X = load_array("test_X.npy").astype(np.float32)
+test_y = load_array("test_y.npy").astype(np.float32)
+
+
+# ============================================================
+# VALIDATE TEST SHAPES
+# ============================================================
+
+expected_sequence_length = checkpoint["sequence_length"]
+expected_input_dim = checkpoint["input_dim"]
+expected_output_dim = checkpoint["output_dim"]
+
+if test_X.ndim != 3:
+    raise ValueError(
+        f"test_X must be 3D. Received {test_X.shape}"
+    )
+
+if test_y.ndim != 2:
+    raise ValueError(
+        f"test_y must be 2D. Received {test_y.shape}"
+    )
+
+if test_X.shape[1] != expected_sequence_length:
+    raise ValueError(
+        f"Sequence length mismatch: {test_X.shape[1]} "
+        f"vs {expected_sequence_length}"
+    )
+
+if test_X.shape[2] != expected_input_dim:
+    raise ValueError(
+        f"Input dimension mismatch: {test_X.shape[2]} "
+        f"vs {expected_input_dim}"
+    )
+
+if test_y.shape[1] != expected_output_dim:
+    raise ValueError(
+        f"Target dimension mismatch: {test_y.shape[1]} "
+        f"vs {expected_output_dim}"
+    )
+
+if len(test_X) != len(test_y):
+    raise ValueError(
+        "The number of test inputs and targets does not match."
+    )
+
+
+# ============================================================
+# HANDLE NON-FINITE INPUT VALUES
+# ============================================================
+
+if not np.isfinite(test_X[:, :, :CLINICAL_START]).all():
+    raise ValueError(
+        "Non-finite values found in image embeddings. "
+        "Check the saved sequence arrays."
+    )
+
+if not np.isfinite(test_y).all():
+    raise ValueError(
+        "Non-finite values found in target embeddings. "
+        "Check the saved sequence arrays."
+    )
+
+
+# ============================================================
+# APPLY TRAINING CLINICAL NORMALIZATION
+# Use the mean and standard deviation saved in the checkpoint.
+# Do not calculate new statistics from the test set.
+# ============================================================
+
+clinical = test_X[
+    :, :, CLINICAL_START:CLINICAL_END
+].copy()
+
+clinical = np.where(
+    np.isfinite(clinical),
+    clinical,
+    clinical_mean.reshape(1, 1, -1),
+)
+
+clinical = (
+    clinical - clinical_mean.reshape(1, 1, -1)
+) / clinical_std.reshape(1, 1, -1)
+
+test_X[:, :, CLINICAL_START:CLINICAL_END] = clinical
+
+if not np.isfinite(test_X).all():
+    raise ValueError(
+        "Non-finite values remain in test inputs after normalization."
+    )
+
+
+# ============================================================
+# NORMALIZE TARGET EMBEDDINGS
+# ============================================================
+
+target_norms_before = np.linalg.norm(
+    test_y,
+    axis=1,
+    keepdims=True,
+)
+
+test_y = test_y / np.maximum(
+    target_norms_before,
+    1e-12,
+)
+
+
+# ============================================================
+# CREATE TEST DATALOADER
+# ============================================================
+
+test_dataset = TensorDataset(
+    torch.from_numpy(test_X),
+    torch.from_numpy(test_y),
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=0,
+)
+
+
+# ============================================================
+# RUN EVALUATION
+# ============================================================
+
+all_predictions = []
+all_targets = []
 
 with torch.no_grad():
 
-    for X_batch, y_batch in loader:
+    for X_batch, y_batch in test_loader:
 
         X_batch = X_batch.to(DEVICE)
+        y_batch = y_batch.to(DEVICE)
 
-        output = model(
-            X_batch
+        predictions = model(X_batch)
+
+        all_predictions.append(
+            predictions.cpu().numpy()
         )
 
-        predictions.append(
-            output.cpu().numpy()
-        )
-
-        targets.append(
-            y_batch.numpy()
+        all_targets.append(
+            y_batch.cpu().numpy()
         )
 
 
 predictions = np.concatenate(
-    predictions,
-    axis=0
+    all_predictions,
+    axis=0,
 )
 
 targets = np.concatenate(
-    targets,
-    axis=0
+    all_targets,
+    axis=0,
 )
 
 
 # ============================================================
-# MSE
+# CALCULATE METRICS
 # ============================================================
 
+# Mean squared error across all test samples and dimensions.
 mse = np.mean(
     (predictions - targets) ** 2
 )
 
+# Embedding norms.
+prediction_norms = np.linalg.norm(
+    predictions,
+    axis=1,
+)
 
-# ============================================================
-# COSINE SIMILARITY
-# ============================================================
+target_norms = np.linalg.norm(
+    targets,
+    axis=1,
+)
 
-numerator = np.sum(
+# Cosine similarity for each test sample.
+dot_products = np.sum(
     predictions * targets,
-    axis=1
+    axis=1,
 )
 
-denominator = (
-    np.linalg.norm(
-        predictions,
-        axis=1
-    )
-    *
-    np.linalg.norm(
-        targets,
-        axis=1
-    )
-)
-
-denominator = np.maximum(
-    denominator,
-    1e-8
+denominators = np.maximum(
+    prediction_norms * target_norms,
+    1e-12,
 )
 
 cosine_similarity = (
-    numerator / denominator
+    dot_products / denominators
+)
+
+# Mean and median squared error per sample.
+sample_mse = np.mean(
+    (predictions - targets) ** 2,
+    axis=1,
 )
 
 
 # ============================================================
-# RESULTS
+# DISPLAY RESULTS
 # ============================================================
 
-print()
-print("=" * 60)
-print("TEST RESULTS")
-print("=" * 60)
+print(
+    "\n"
+    "============================================================"
+)
+
+print("TEMPORAL EMBEDDING PREDICTION RESULTS")
 
 print(
-    f"Test MSE: {mse:.6f}"
+    "============================================================"
+)
+
+print(f"Test samples: {len(targets)}")
+
+print(f"Test MSE: {mse:.6f}")
+
+print(
+    f"Mean sample MSE: {sample_mse.mean():.6f}"
 )
 
 print(
-    f"Mean Cosine Similarity: "
+    f"Median sample MSE: {np.median(sample_mse):.6f}"
+)
+
+print(
+    f"Mean cosine similarity: "
     f"{cosine_similarity.mean():.6f}"
 )
 
 print(
-    f"Median Cosine Similarity: "
+    f"Median cosine similarity: "
     f"{np.median(cosine_similarity):.6f}"
 )
 
 print(
-    f"Minimum Cosine Similarity: "
+    f"Minimum cosine similarity: "
     f"{cosine_similarity.min():.6f}"
 )
 
 print(
-    f"Maximum Cosine Similarity: "
+    f"Maximum cosine similarity: "
     f"{cosine_similarity.max():.6f}"
 )
 
-print("=" * 60)
-print("EVALUATION COMPLETE")
-print("=" * 60)
+print(
+    f"Mean predicted embedding norm: "
+    f"{prediction_norms.mean():.6f}"
+)
+
+print(
+    f"Mean target embedding norm: "
+    f"{target_norms.mean():.6f}"
+)
+
+print(
+    "============================================================"
+)
+
+print("Evaluation completed successfully.")

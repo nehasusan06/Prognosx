@@ -83,17 +83,25 @@ class TemporalTransformer(nn.Module):
     ):
         super().__init__()
 
+        # Input projection
         self.input_projection = nn.Linear(
             input_dim,
             d_model
         )
 
+        # Position embedding
+        self.position_embedding = nn.Parameter(
+            torch.zeros(1, 3, d_model)
+        )
+
+        # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=True
+            batch_first=True,
+            activation="gelu"
         )
 
         self.transformer = nn.TransformerEncoder(
@@ -101,17 +109,25 @@ class TemporalTransformer(nn.Module):
             num_layers=num_layers
         )
 
-        self.output_layer = nn.Linear(
-            d_model,
-            output_dim
+        # Output layer
+        self.output_layer = nn.Sequential(
+            nn.Linear(
+                d_model,
+                output_dim
+            ),
+            nn.LayerNorm(output_dim)
         )
 
     def forward(self, x):
 
         x = self.input_projection(x)
 
+        # Add temporal position information
+        x = x + self.position_embedding
+
         x = self.transformer(x)
 
+        # Use final time step
         x = x[:, -1, :]
 
         x = self.output_layer(x)
@@ -208,7 +224,7 @@ def generate_predictions(split):
 
 
 # ============================================================
-# LOAD LABELS
+# LOAD RADIOGRAPHIC LABELS
 # ============================================================
 
 print("\n" + "=" * 70)
@@ -233,6 +249,7 @@ print(
 )
 
 if duplicate_ids > 0:
+
     raise ValueError(
         "Duplicate dicom_id values found in "
         "training_manifest_labeled.csv"
@@ -270,19 +287,31 @@ def get_labels(split):
         f"{split}: missing label records = {missing}"
     )
 
-    if missing > 0:
-        raise ValueError(
-            f"{missing} target DICOM IDs could not "
-            f"be matched with labels."
-        )
+    # --------------------------------------------------------
+    # KEEP ONLY MATCHED LABEL RECORDS
+    # --------------------------------------------------------
 
-    return merged[FINDINGS].values.astype(
+    matched_mask = (
+        merged["dicom_id"].notna().to_numpy()
+    )
+
+    matched_labels = merged.loc[
+        matched_mask,
+        FINDINGS
+    ].values.astype(
         np.float32
     )
 
+    print(
+        f"{split}: labeled sequences = "
+        f"{len(matched_labels)}"
+    )
+
+    return matched_labels, matched_mask
+
 
 # ============================================================
-# LOAD ALL SPLITS
+# GENERATE PREDICTIONS
 # ============================================================
 
 train_pred, train_actual = generate_predictions(
@@ -297,9 +326,39 @@ test_pred, test_actual = generate_predictions(
     "test"
 )
 
-train_labels = get_labels("train")
-val_labels = get_labels("validation")
-test_labels = get_labels("test")
+
+# ============================================================
+# LOAD LABELS
+# ============================================================
+
+train_labels, train_label_mask = get_labels(
+    "train"
+)
+
+val_labels, val_label_mask = get_labels(
+    "validation"
+)
+
+test_labels, test_label_mask = get_labels(
+    "test"
+)
+
+
+# ============================================================
+# ALIGN PREDICTIONS WITH LABELS
+# ============================================================
+
+train_pred = train_pred[
+    train_label_mask
+]
+
+val_pred = val_pred[
+    val_label_mask
+]
+
+test_pred = test_pred[
+    test_label_mask
+]
 
 
 # ============================================================
@@ -310,13 +369,35 @@ print("\n" + "=" * 70)
 print("DATA CHECK")
 print("=" * 70)
 
-print("Train predictions :", train_pred.shape)
-print("Validation predictions :", val_pred.shape)
-print("Test predictions :", test_pred.shape)
+print(
+    "Train predictions :",
+    train_pred.shape
+)
 
-print("Train labels :", train_labels.shape)
-print("Validation labels :", val_labels.shape)
-print("Test labels :", test_labels.shape)
+print(
+    "Validation predictions :",
+    val_pred.shape
+)
+
+print(
+    "Test predictions :",
+    test_pred.shape
+)
+
+print(
+    "Train labels :",
+    train_labels.shape
+)
+
+print(
+    "Validation labels :",
+    val_labels.shape
+)
+
+print(
+    "Test labels :",
+    test_labels.shape
+)
 
 
 # ============================================================
@@ -445,7 +526,6 @@ for i, finding in enumerate(FINDINGS):
 
     train_y = train_labels[:, i]
 
-    # Keep ONLY 0 and 1
     train_mask = np.isin(
         train_y,
         [0.0, 1.0]
@@ -509,7 +589,10 @@ for i, finding in enumerate(FINDINGS):
         f"Test samples: {len(y_test)}"
     )
 
-    # Need both classes for training
+    # --------------------------------------------------------
+    # NEED BOTH CLASSES FOR TRAINING
+    # --------------------------------------------------------
+
     if len(np.unique(y_train)) < 2:
 
         print(
@@ -559,7 +642,7 @@ for i, finding in enumerate(FINDINGS):
         X_val_scaled
     )[:, 1]
 
-    # Select threshold ONLY using validation
+    # Threshold selected ONLY from validation
     threshold = find_best_threshold(
         y_val,
         val_probabilities
@@ -634,6 +717,7 @@ for i, finding in enumerate(FINDINGS):
         "auroc": metrics["auroc"],
 
         "auprc": metrics["auprc"]
+
     })
 
 
@@ -720,9 +804,17 @@ results_df.to_csv(
 # FINAL TABLE
 # ============================================================
 
-print("\n\n" + "=" * 100)
-print("FINAL RADIOGRAPHIC CLASSIFICATION RESULTS")
-print("=" * 100)
+print(
+    "\n\n" + "=" * 100
+)
+
+print(
+    "FINAL RADIOGRAPHIC CLASSIFICATION RESULTS"
+)
+
+print(
+    "=" * 100
+)
 
 display_columns = [
     "finding",
@@ -743,10 +835,43 @@ print(
     )
 )
 
-print("\n" + "=" * 100)
+print(
+    "\n" + "=" * 100
+)
 
 print(
     f"Results saved to:\n{output_file}"
 )
 
 print("=" * 100)
+
+
+# ============================================================
+# OVERALL RADIOGRAPHIC CLASSIFICATION RESULTS
+# ============================================================
+
+print("\n" + "=" * 50)
+
+print(
+    "OVERALL RADIOGRAPHIC CLASSIFICATION RESULTS"
+)
+
+print("=" * 50)
+
+print(
+    f"Accuracy  : {macro_results['accuracy']:.4f}"
+)
+
+print(
+    f"Precision : {macro_results['precision']:.4f}"
+)
+
+print(
+    f"Recall    : {macro_results['recall']:.4f}"
+)
+
+print(
+    f"F1-Score  : {macro_results['f1']:.4f}"
+)
+
+print("=" * 50)

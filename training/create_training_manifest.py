@@ -75,3 +75,15 @@ print(f"Missing study_id: {manifest['study_id'].isna().sum():,}")
 print("\nColumns:")
 for column in manifest.columns:
     print(column)
+
+
+
+
+
+
+
+
+
+
+
+    
