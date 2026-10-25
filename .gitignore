@@ -1,15 +1,17 @@
-﻿venv/
-.venv/
+﻿# Python
 __pycache__/
-*.pyc
+*.py[cod]
+venv/
+.venv/
 
+# Secrets
+.env
+.env.*
+
+# Generated data
 data/raw/
 data/processed/
+models/*.pt
 
-embeddings/
-*.pt
-*.pth
-*.bin
-*.safetensors
-
-.env
+# Generated reports
+reports/
